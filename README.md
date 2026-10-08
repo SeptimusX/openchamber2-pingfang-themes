@@ -52,13 +52,32 @@ What `install.cjs` does, and why each step is needed:
 2. **Patches `web-dist/assets/index-*.js`** (with a backup in `backups/`):
    - adds two font entries so *Settings → Appearance* offers **PingFang SC (苹方)** and
      **PingFang Mono SC**;
-   - shrinks the desktop type scale so UI text sits one step below chat text:
-     chat/markdown stays `0.875rem` (14px), UI header `0.8125rem` (13px),
+   - shrinks the UI type scale so UI text sits one step below chat text:
+     chat/markdown is left alone, UI header `0.8125rem` (13px),
      UI label/meta `0.75rem` (12px), micro `0.6875rem` (11px), settings page title `1rem` (16px).
 3. **Presets the settings** (`uiFont`, `monoFont`, light/dark theme) in
    `%USERPROFILE%\.config\openchamber\settings.json` and `preferences.json`.
+   Existing keys are updated, **missing keys are inserted** (so a fresh profile works in one
+   step), and everything else — other fields, per-surface overrides, `value`/`surfaces`
+   shapes — is preserved. `preferences.json` entries are written as
+   `{ updatedAt, value }`.
 
 The script is idempotent — re-running it is safe and does nothing twice.
+
+### How the bundle is located (rename-resistant)
+
+The patch does not depend on minified variable names or on exact upstream wording:
+
+- **Font entries** are found by their stable registry id — `id:"system"` (UI) and
+  `id:"system-mono"` (code) — and the new entry is inserted right after its anchor, so
+  reworded labels/descriptions or a changed fallback stack don't break it.
+- **Type scale**: any brace-free object literal that declares `markdown` + `uiHeader` +
+  `settingsPageTitle` is treated as a typography preset, regardless of property order or the
+  variable it is assigned to; only the UI keys are rewritten, so each preset keeps its own
+  chat/markdown size. Both presets shipped with OpenChamber 2 (the desktop one and the
+  smaller one used by the embedded VS Code view) are patched this way.
+- A missing anchor is reported (`! ... skipping`) instead of silently doing nothing, and a
+  `settings.json` / `preferences.json` that is not valid JSON is left untouched.
 
 ### Manual alternative
 
@@ -79,6 +98,7 @@ The script is idempotent — re-running it is safe and does nothing twice.
 
 If a setting did not stick (multiple OpenChamber clients write `preferences.json`, last write
 wins), just pick it from the dropdown — the two font entries are available after the patch.
+Re-running `node install.cjs` re-applies the settings.
 
 ## After every OpenChamber update / 更新后
 
@@ -88,7 +108,9 @@ An update replaces `web-dist`, so the patch is lost. Re-run:
 node install.cjs
 ```
 
-and restart. Themes in `~/.config/openchamber/themes/` survive updates.
+and restart. Themes in `~/.config/openchamber/themes/` survive updates. The output tells you
+what happened per step (`+` applied, `=` already applied, `!` anchor not found — in that case
+the bundle changed shape and the script needs a look, nothing is written half-way).
 
 ## How this was derived
 

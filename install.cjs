@@ -3,14 +3,16 @@
 // Does three things:
 //   1) copies themes/*.json            -> %USERPROFILE%\.config\openchamber\themes\
 //   2) patches OpenChamber's renderer  -> adds "PingFang SC (苹方)" / "PingFang Mono SC"
-//      bundle (web-dist/assets/index-*.js)   font entries and shrinks desktop UI type one
-//                                          step below chat type (chat stays 0.875rem)
+//      bundle (web-dist/assets/index-*.js)   font entries and shrinks UI type one step
+//                                          below chat type (chat/markdown is left alone)
 //   3) presets Interface Font / Code Font / light+dark theme in OpenChamber's settings
+//      (existing keys are updated, missing keys are inserted, everything else is kept)
 //
 // Idempotent: re-run after every OpenChamber update. A backup of every bundle it touches
 // is written to ./backups/ next to this file.
 //
 // Usage:  node install.cjs
+//         OPENCHAMBER_RESOURCES=/path/to/resources node install.cjs   (macOS/Linux)
 const fs = require('fs');
 const path = require('path');
 
@@ -33,13 +35,24 @@ const SANS_STACK =
 const MONO_STACK =
   '"PingFang Mono SC", "PingFang Mono SC Mod3", "SFMono-Regular", "Menlo", "Consolas", monospace';
 
-// anchors found in the OpenChamber 2 bundle
-const UI_ENTRY = `{id:"system",label:"System",description:"Native operating system interface font.",stack:'-apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif'}`;
-const UI_ENTRY_PATCHED = UI_ENTRY + `,{id:"${FONT_ID_UI}",label:"PingFang SC (苹方)",description:"PingFang SC (苹方) - local system font.",stack:'${SANS_STACK}'}`;
-const MONO_ENTRY = `{id:"system-mono",label:"System Mono",description:"Native operating system monospace font.",stack:'ui-monospace, "SFMono-Regular", "Menlo", "Cascadia Mono", "Segoe UI Mono", monospace'}`;
-const MONO_ENTRY_PATCHED = MONO_ENTRY + `,{id:"${FONT_ID_MONO}",label:"PingFang Mono SC",description:"PingFang Mono SC - local system monospace font.",stack:'${MONO_STACK}'}`;
-const SCALE_OLD = `{markdown:"0.875rem",code:"0.75rem",uiHeader:"0.875rem",uiLabel:"0.84375rem",meta:"0.8125rem",micro:"0.8125rem",settingsPageTitle:"1.0625rem"}`;
-const SCALE_NEW = `{markdown:"0.875rem",code:"0.75rem",uiHeader:"0.8125rem",uiLabel:"0.75rem",meta:"0.75rem",micro:"0.6875rem",settingsPageTitle:"1rem"}`;
+const UI_ENTRY_NEW =
+  `{id:"${FONT_ID_UI}",label:"PingFang SC (苹方)",description:"PingFang SC (苹方) - local system font.",stack:'${SANS_STACK}'}`;
+const MONO_ENTRY_NEW =
+  `{id:"${FONT_ID_MONO}",label:"PingFang Mono SC",description:"PingFang Mono SC - local system monospace font.",stack:'${MONO_STACK}'}`;
+
+// The font registry entries we anchor on. Only these ids are stable across builds --
+// labels/descriptions/stacks may be reworded, and minified variable names may change.
+const UI_ANCHOR_ID = 'system';
+const MONO_ANCHOR_ID = 'system-mono';
+
+// UI type, one step below chat type (markdown/code are never touched).
+const SCALE_TARGETS = {
+  uiHeader: '0.8125rem', // 13px
+  uiLabel: '0.75rem', //   12px
+  meta: '0.75rem', //      12px
+  micro: '0.6875rem', //   11px
+  settingsPageTitle: '1rem', // 16px
+};
 
 const log = (...a) => console.log(...a);
 
@@ -51,6 +64,55 @@ for (const f of fs.readdirSync(themesSrc).filter((f) => f.endsWith('.json'))) {
 }
 
 // ---- 2) app patch -----------------------------------------------------------------
+
+// A flat (brace-free) object literal whose first property is `id: "<value>"`.
+// Deliberately ignores labels/descriptions/stacks and whitespace, so reworded
+// entries or a different minifier output still match.
+function findEntryLiteral(src, id) {
+  const re = new RegExp('\\{[^{}]*\\bid["\']?\\s*:\\s*["\']' + id + '["\'][^{}]*\\}');
+  const m = re.exec(src);
+  return m ? { start: m.index, end: m.index + m[0].length, text: m[0] } : null;
+}
+
+// Rewrite the value of `key` inside a flat object literal, preserving its quoting style.
+function setLiteralProp(literal, key, value) {
+  const re = new RegExp('(\\b' + key + '\\s*:\\s*)(["\'])(?:[^"\'\\\\]|\\\\.)*\\2');
+  if (!re.test(literal)) return { literal, changed: false, found: false };
+  const next = literal.replace(re, (m, pre, quote) => pre + quote + value + quote);
+  return { literal: next, changed: next !== literal, found: true };
+}
+
+// Typography scale presets are brace-free object literals that declare `markdown`
+// and `settingsPageTitle` next to CSS length strings. We find them by content, not by
+// the minified variable name they are assigned to, and shrink the UI keys in place.
+function patchTypeScales(src) {
+  let patched = 0;
+  let seen = 0;
+  const out = src.replace(/\{[^{}]*\}/g, (literal) => {
+    if (!/\bmarkdown\s*:/.test(literal)) return literal;
+    if (!/\bsettingsPageTitle\s*:/.test(literal)) return literal;
+    if (!/\buiHeader\s*:/.test(literal)) return literal;
+    seen += 1;
+    let next = literal;
+    let changed = false;
+    for (const [key, value] of Object.entries(SCALE_TARGETS)) {
+      const r = setLiteralProp(next, key, value);
+      next = r.literal;
+      if (r.changed) changed = true;
+    }
+    if (changed) patched += 1;
+    return next;
+  });
+  return { src: out, seen, patched };
+}
+
+// Insert a registry entry right after the entry with `anchorId`.
+function addFontEntry(src, anchorId, newEntry) {
+  const anchor = findEntryLiteral(src, anchorId);
+  if (!anchor) return null;
+  return src.slice(0, anchor.end) + ',' + newEntry + src.slice(anchor.end);
+}
+
 if (!fs.existsSync(assetsDir)) {
   log('! OpenChamber assets not found at', assetsDir);
   log('  set OPENCHAMBER_RESOURCES to ...\\resources and re-run to apply the font/type patch.');
@@ -59,67 +121,138 @@ if (!fs.existsSync(assetsDir)) {
   let touched = false;
   for (const file of bundles) {
     const full = path.join(assetsDir, file);
-    let src = fs.readFileSync(full, 'utf8');
-    if (!src.includes(UI_ENTRY) && !src.includes(UI_ENTRY_PATCHED)) continue; // not the bundle
-    const before = src;
-    const needsFonts = !src.includes(`id:"${FONT_ID_UI}"`);
-    const needsScale = !src.includes(SCALE_NEW);
-    if ((needsFonts || needsScale) && !fs.existsSync(path.join(backupDir, file))) {
+    const before = fs.readFileSync(full, 'utf8');
+    // The renderer bundle is the one holding the font registry.
+    if (!findEntryLiteral(before, UI_ANCHOR_ID) || !findEntryLiteral(before, MONO_ANCHOR_ID)) continue;
+
+    let src = before;
+
+    // --- font entries
+    const hasUi = src.includes(`id:"${FONT_ID_UI}"`);
+    const hasMono = src.includes(`id:"${FONT_ID_MONO}"`);
+    if (!hasUi) {
+      const next = addFontEntry(src, UI_ANCHOR_ID, UI_ENTRY_NEW);
+      if (next === null) log(`! UI font anchor (id:"${UI_ANCHOR_ID}") not found in ${file} - skipping`);
+      else src = next;
+    }
+    if (!hasMono) {
+      const next = addFontEntry(src, MONO_ANCHOR_ID, MONO_ENTRY_NEW);
+      if (next === null) log(`! mono font anchor (id:"${MONO_ANCHOR_ID}") not found in ${file} - skipping`);
+      else src = next;
+    }
+    if (src !== before) log(`+ font entries (${FONT_ID_UI} / ${FONT_ID_MONO}) added to ${file}`);
+    else log(`= font entries already present in ${file}`);
+
+    // --- UI type scale
+    const scale = patchTypeScales(src);
+    if (scale.seen === 0) {
+      log(`! no typography scale preset found in ${file} - skipping the type patch`);
+    } else if (scale.patched === 0) {
+      log(`= type scale already patched in ${file} (${scale.seen} preset(s))`);
+    } else {
+      src = scale.src;
+      log(`+ UI type shrunk in ${file} (${scale.patched}/${scale.seen} preset(s))`);
+    }
+
+    if (src === before) {
+      log(`= already patched: ${file}`);
+      continue;
+    }
+    if (!fs.existsSync(path.join(backupDir, file))) {
       fs.mkdirSync(backupDir, { recursive: true });
       fs.copyFileSync(full, path.join(backupDir, file));
       log('+ backup ->', path.join('backups', file));
     }
-    if (needsFonts) {
-      if (!src.includes(UI_ENTRY) || !src.includes(MONO_ENTRY)) {
-        log('! font registry anchors not found in', file, '- OpenChamber may have changed. Skipping.');
-        continue;
-      }
-      src = src.replace(UI_ENTRY, UI_ENTRY_PATCHED).replace(MONO_ENTRY, MONO_ENTRY_PATCHED);
-      log('+ font entries added to', file);
-    }
-    if (needsScale) {
-      if (!src.includes(SCALE_OLD)) {
-        log('! typography scale anchor not found in', file, '- OpenChamber may have changed. Skipping.');
-        continue;
-      }
-      src = src.replace(SCALE_OLD, SCALE_NEW);
-      log('+ desktop UI type shrunk in', file);
-    }
-    if (src !== before) { fs.writeFileSync(full, src, 'utf8'); touched = true; }
-    else log('= already patched:', file);
+    fs.writeFileSync(full, src, 'utf8');
+    touched = true;
   }
   if (!touched) log('= bundle already patched');
 }
 
 // ---- 3) settings ------------------------------------------------------------------
+// Merge the desired values in: keys that exist are updated, missing keys are inserted,
+// everything else (other fields, per-surface overrides, value/surfaces shapes) is kept.
 const now = Date.now();
-const prefs = {
+const desired = {
   uiFont: FONT_ID_UI,
   monoFont: FONT_ID_MONO,
   lightThemeId: 'pingfang-mono-plus-light',
   darkThemeId: 'pingfang-mono-plus-dark',
 };
 
-const pp = path.join(configDir, 'preferences.json');
-if (fs.existsSync(pp)) {
-  let p = fs.readFileSync(pp, 'utf8');
-  for (const [key, value] of Object.entries(prefs)) {
-    const re = new RegExp('("' + key + '":\\s*\\{\\s*"updatedAt":\\s*)\\d+(,\\s*"value":\\s*)"[^"]*"');
-    if (re.test(p)) p = p.replace(re, '$1' + now + '$2"' + value + '"');
+function readJson(file) {
+  if (!fs.existsSync(file)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch (e) {
+    log(`! ${path.basename(file)} is not valid JSON (${e.message}) - leaving it alone`);
+    return false;
   }
-  fs.writeFileSync(pp, p, 'utf8');
-  log('+ preferences.json updated');
 }
 
-const sp = path.join(configDir, 'settings.json');
-if (fs.existsSync(sp)) {
-  let s = fs.readFileSync(sp, 'utf8');
-  for (const [key, value] of Object.entries(prefs)) {
-    const re = new RegExp('"' + key + '"\\s*:\\s*"[^"]*"');
-    if (re.test(s)) s = s.replace(re, '"' + key + '": "' + value + '"');
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(value, null, 2) + '\n', 'utf8');
+}
+
+// settings.json: flat base values.
+const settingsFile = path.join(configDir, 'settings.json');
+const settings = readJson(settingsFile);
+if (settings === false) {
+  // unreadable: skip
+} else {
+  const target = settings || {};
+  let changed = 0;
+  for (const [key, value] of Object.entries(desired)) {
+    if (target[key] !== value) {
+      const had = Object.prototype.hasOwnProperty.call(target, key);
+      target[key] = value;
+      changed += 1;
+      log(`  ${had ? '~' : '+'} settings.json ${key} = ${value}`);
+    }
   }
-  fs.writeFileSync(sp, s, 'utf8');
-  log('+ settings.json updated');
+  if (changed) {
+    writeJson(settingsFile, target);
+    log(`+ settings.json updated (${changed} field(s))`);
+  } else {
+    log('= settings.json already set');
+  }
+}
+
+// preferences.json: { version, fields: { key: { updatedAt, value[, surfaces] } } }
+const prefsFile = path.join(configDir, 'preferences.json');
+const prefs = readJson(prefsFile);
+if (prefs === false) {
+  // unreadable: skip
+} else {
+  const target = prefs || {};
+  if (!target.fields || typeof target.fields !== 'object' || Array.isArray(target.fields)) {
+    target.fields = {};
+  }
+  if (target.version === undefined) target.version = 1;
+  let changed = 0;
+  for (const [key, value] of Object.entries(desired)) {
+    const current = target.fields[key];
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      target.fields[key] = { updatedAt: now, value };
+      changed += 1;
+      log(`  + preferences.json ${key} = ${value}`);
+      continue;
+    }
+    if (current.value !== value) {
+      current.value = value;
+      current.updatedAt = now;
+      changed += 1;
+      log(`  ~ preferences.json ${key} = ${value}`);
+    }
+  }
+  if (changed) {
+    writeJson(prefsFile, target);
+    log(`+ preferences.json updated (${changed} field(s))`);
+  } else {
+    log('= preferences.json already set');
+  }
 }
 
 log('\nDone. Restart OpenChamber to apply (the desktop window reads web-dist from disk).');
