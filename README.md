@@ -49,7 +49,10 @@ What `install.cjs` does, and why each step is needed:
 
 1. **Copies `themes/*.json`** into `%USERPROFILE%\.config\openchamber\themes\` — the folder
    OpenChamber 2 scans for custom themes.
-2. **Patches `web-dist/assets/index-*.js`** (with a backup in `backups/`):
+2. **Patches OpenChamber's renderer chunks** in `web-dist/assets/` (with a backup in `backups/`).
+   The chunk names are content-hashed and change between releases — 2.1.x kept the registry in
+   `index-*.js`, 2.5.0 moved it to `katex.min-*.js` — so the script finds them **by content**,
+   never by file name:
    - adds two font entries so *Settings → Appearance* offers **PingFang SC (苹方)** and
      **PingFang Mono SC**;
    - shrinks the UI type scale so UI text sits one step below chat text:
@@ -66,17 +69,23 @@ The script is idempotent — re-running it is safe and does nothing twice.
 
 ### How the bundle is located (rename-resistant)
 
-The patch does not depend on minified variable names or on exact upstream wording:
+The patch does not depend on chunk file names, minified variable names or exact upstream wording:
 
+- **Chunks**: every `web-dist/assets/*.js` is read; the ones that actually carry the font
+  registry / typography presets are patched, whatever they are called. A release that renames
+  or re-splits its bundles (2.5.0 moved the registry into `katex.min-*.js`) still gets patched.
 - **Font entries** are found by their stable registry id — `id:"system"` (UI) and
-  `id:"system-mono"` (code) — and the new entry is inserted right after its anchor, so
-  reworded labels/descriptions or a changed fallback stack don't break it.
+  `id:"system-mono"` (code) — **and** must be an object that also declares a `stack:`
+  property, so option lists that merely reuse the id `"system"` (e.g. the PWA orientation
+  dropdown) are never touched. New entries are inserted right after their anchor, so reworded
+  labels/descriptions or a changed fallback stack don't break it.
 - **Type scale**: any brace-free object literal that declares `markdown` + `uiHeader` +
   `settingsPageTitle` is treated as a typography preset, regardless of property order or the
   variable it is assigned to; only the UI keys are rewritten, so each preset keeps its own
   chat/markdown size. Both presets shipped with OpenChamber 2 (the desktop one and the
-  smaller one used by the embedded VS Code view) are patched this way.
-- A missing anchor is reported (`! ... skipping`) instead of silently doing nothing, and a
+  smaller one used by the embedded VS Code view) are patched this way. Upstream tweaking the
+  preset values (2.5.0 changed `meta`/`micro`) is fine — the targets are written by name.
+- A missing anchor is reported (`! ...`) instead of silently doing nothing, and a
   `settings.json` / `preferences.json` that is not valid JSON is left untouched.
 
 ### Manual alternative

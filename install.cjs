@@ -3,7 +3,7 @@
 // Does three things:
 //   1) copies themes/*.json            -> %USERPROFILE%\.config\openchamber\themes\
 //   2) patches OpenChamber's renderer  -> adds "PingFang SC (苹方)" / "PingFang Mono SC"
-//      bundle (web-dist/assets/index-*.js)   font entries and shrinks UI type one step
+//      chunks (web-dist/assets/*.js)        font entries and shrinks UI type one step
 //                                          below chat type (chat/markdown is left alone)
 //   3) presets Interface Font / Code Font / light+dark theme in OpenChamber's settings
 //      (existing keys are updated, missing keys are inserted, everything else is kept)
@@ -65,13 +65,20 @@ for (const f of fs.readdirSync(themesSrc).filter((f) => f.endsWith('.json'))) {
 
 // ---- 2) app patch -----------------------------------------------------------------
 
-// A flat (brace-free) object literal whose first property is `id: "<value>"`.
-// Deliberately ignores labels/descriptions/stacks and whitespace, so reworded
-// entries or a different minifier output still match.
-function findEntryLiteral(src, id) {
-  const re = new RegExp('\\{[^{}]*\\bid["\']?\\s*:\\s*["\']' + id + '["\'][^{}]*\\}');
-  const m = re.exec(src);
-  return m ? { start: m.index, end: m.index + m[0].length, text: m[0] } : null;
+// A flat (brace-free) object literal that is a **font registry entry**: it carries
+// `id: "<value>"` *and* a `stack:` property. Requiring the stack keeps us away from
+// option lists that merely reuse ids like "system" (e.g. the PWA orientation dropdown
+// in SettingsView-*.js). Property order is irrelevant and the minified variable name
+// is never consulted.
+function findFontEntryLiteral(src, id) {
+  const idRe = new RegExp('\\bid["\']?\\s*:\\s*["\']' + id + '["\']');
+  for (const m of src.matchAll(/\{[^{}]*\}/g)) {
+    const literal = m[0];
+    if (!idRe.test(literal)) continue;
+    if (!/\bstack\s*:/.test(literal)) continue;
+    return { start: m.index, end: m.index + literal.length, text: literal };
+  }
+  return null;
 }
 
 // Rewrite the value of `key` inside a flat object literal, preserving its quoting style.
@@ -106,9 +113,8 @@ function patchTypeScales(src) {
   return { src: out, seen, patched };
 }
 
-// Insert a registry entry right after the entry with `anchorId`.
-function addFontEntry(src, anchorId, newEntry) {
-  const anchor = findEntryLiteral(src, anchorId);
+// Insert a registry entry right after the anchor entry.
+function addFontEntry(src, anchor, newEntry) {
   if (!anchor) return null;
   return src.slice(0, anchor.end) + ',' + newEntry + src.slice(anchor.end);
 }
@@ -117,47 +123,81 @@ if (!fs.existsSync(assetsDir)) {
   log('! OpenChamber assets not found at', assetsDir);
   log('  set OPENCHAMBER_RESOURCES to ...\\resources and re-run to apply the font/type patch.');
 } else {
-  const bundles = fs.readdirSync(assetsDir).filter((f) => /^index-.*\.js$/.test(f));
+  // The registry + typography presets live in a content-hashed chunk whose *file name*
+  // changes between releases (2.1.x: index-*.js, 2.5.0: katex.min-*.js). Never trust the
+  // name: read every JS chunk and patch the one(s) that carry the anchors.
+  const bundles = fs.readdirSync(assetsDir).filter((f) => f.endsWith('.js'));
   let touched = false;
+  let sawRegistry = false;
+  let sawPresets = false;
   for (const file of bundles) {
     const full = path.join(assetsDir, file);
-    const before = fs.readFileSync(full, 'utf8');
-    // The renderer bundle is the one holding the font registry.
-    if (!findEntryLiteral(before, UI_ANCHOR_ID) || !findEntryLiteral(before, MONO_ANCHOR_ID)) continue;
-
-    let src = before;
-
-    // --- font entries
-    const hasUi = src.includes(`id:"${FONT_ID_UI}"`);
-    const hasMono = src.includes(`id:"${FONT_ID_MONO}"`);
-    if (!hasUi) {
-      const next = addFontEntry(src, UI_ANCHOR_ID, UI_ENTRY_NEW);
-      if (next === null) log(`! UI font anchor (id:"${UI_ANCHOR_ID}") not found in ${file} - skipping`);
-      else src = next;
-    }
-    if (!hasMono) {
-      const next = addFontEntry(src, MONO_ANCHOR_ID, MONO_ENTRY_NEW);
-      if (next === null) log(`! mono font anchor (id:"${MONO_ANCHOR_ID}") not found in ${file} - skipping`);
-      else src = next;
-    }
-    if (src !== before) log(`+ font entries (${FONT_ID_UI} / ${FONT_ID_MONO}) added to ${file}`);
-    else log(`= font entries already present in ${file}`);
-
-    // --- UI type scale
-    const scale = patchTypeScales(src);
-    if (scale.seen === 0) {
-      log(`! no typography scale preset found in ${file} - skipping the type patch`);
-    } else if (scale.patched === 0) {
-      log(`= type scale already patched in ${file} (${scale.seen} preset(s))`);
-    } else {
-      src = scale.src;
-      log(`+ UI type shrunk in ${file} (${scale.patched}/${scale.seen} preset(s))`);
-    }
-
-    if (src === before) {
-      log(`= already patched: ${file}`);
+    let before;
+    try {
+      before = fs.readFileSync(full, 'utf8');
+    } catch {
       continue;
     }
+    // Cheap content gate before doing regex work on multi-MB chunks.
+    const maybeRegistry =
+      before.includes('stack:') &&
+      (before.includes(`id:"${UI_ANCHOR_ID}"`) || before.includes(`id:'${UI_ANCHOR_ID}'`));
+    const maybePreset = before.includes('settingsPageTitle') && before.includes('markdown');
+    if (!maybeRegistry && !maybePreset) continue;
+
+    let src = before;
+    const notes = [];
+
+    // --- font entries (only in the chunk that owns the font registry)
+    if (maybeRegistry) {
+      const isFontList =
+        !!findFontEntryLiteral(src, UI_ANCHOR_ID) || !!findFontEntryLiteral(src, MONO_ANCHOR_ID);
+      if (!isFontList) continue; // uses id:"system" for something else (option lists)
+      sawRegistry = true;
+
+      const hasUi = src.includes(`id:"${FONT_ID_UI}"`) || src.includes(`id:'${FONT_ID_UI}'`);
+      const hasMono = src.includes(`id:"${FONT_ID_MONO}"`) || src.includes(`id:'${FONT_ID_MONO}'`);
+      const added = [];
+      // Re-locate the anchor right before each insertion: the first insert shifts every
+      // offset after it, so cached offsets would corrupt the chunk.
+      if (!hasUi) {
+        const uiAnchor = findFontEntryLiteral(src, UI_ANCHOR_ID);
+        const next = addFontEntry(src, uiAnchor, UI_ENTRY_NEW);
+        if (next === null) notes.push(`! UI font anchor (id:"${UI_ANCHOR_ID}") not found`);
+        else {
+          src = next;
+          added.push(FONT_ID_UI);
+        }
+      }
+      if (!hasMono) {
+        const monoAnchor = findFontEntryLiteral(src, MONO_ANCHOR_ID);
+        const next = addFontEntry(src, monoAnchor, MONO_ENTRY_NEW);
+        if (next === null) notes.push(`! mono font anchor (id:"${MONO_ANCHOR_ID}") not found`);
+        else {
+          src = next;
+          added.push(FONT_ID_MONO);
+        }
+      }
+      if (added.length) notes.push(`+ font entries added (${added.join(' / ')})`);
+      else if (hasUi && hasMono) notes.push('= font entries already present');
+    }
+
+    // --- UI type scale (may also live in the same or another chunk)
+    const scale = patchTypeScales(src);
+    if (scale.seen > 0) {
+      sawPresets = true;
+      if (scale.patched > 0) {
+        src = scale.src;
+        notes.push(`+ UI type shrunk (${scale.patched}/${scale.seen} preset(s))`);
+      } else {
+        notes.push(`= type scale already patched (${scale.seen} preset(s))`);
+      }
+    }
+
+    if (!notes.length) continue;
+    for (const n of notes) log(`${n} in ${file}`);
+
+    if (src === before) continue;
     if (!fs.existsSync(path.join(backupDir, file))) {
       fs.mkdirSync(backupDir, { recursive: true });
       fs.copyFileSync(full, path.join(backupDir, file));
@@ -166,7 +206,9 @@ if (!fs.existsSync(assetsDir)) {
     fs.writeFileSync(full, src, 'utf8');
     touched = true;
   }
-  if (!touched) log('= bundle already patched');
+  if (!sawRegistry) log(`! font registry (id:"${UI_ANCHOR_ID}") not found in any chunk - fonts not patched`);
+  if (!sawPresets) log('! no typography scale preset found in any chunk - type not patched');
+  if (!touched) log('= bundles already patched');
 }
 
 // ---- 3) settings ------------------------------------------------------------------
